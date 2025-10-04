@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import List, Dict
 from datetime import datetime
+from vit_ocr import VLLMOCRTool
 
 @dataclass
 class StudentRecord:
@@ -15,10 +16,15 @@ class StudentRecord:
     attendance_dates: Dict[str, str]  # date -> attendance status
 
 class OcrToTableTool:
-
     def __init__(self, image, original_image):
         self.thresholded_image = image
         self.original_image = original_image
+        self.vllm_ocr = VLLMOCRTool()
+        
+        # Set up directories
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.ocr_slices_dir = os.path.join(script_dir, "ocr_slices")
+        os.makedirs(self.ocr_slices_dir, exist_ok=True)
 
     def execute(self):
         self.dilate_image()
@@ -43,11 +49,20 @@ class OcrToTableTool:
         return cv2.cvtColor(self.image, self.dilated_image)
 
     def dilate_image(self):
-        kernel_to_remove_gaps_between_words = np.array([
-                [1,1,1,1,1,1,1,1,1,1],
-               [1,1,1,1,1,1,1,1,1,1]
-        ])
-        self.dilated_image = cv2.dilate(self.thresholded_image, kernel_to_remove_gaps_between_words, iterations=5)
+        # Create a larger kernel for better table structure detection
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 1))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 20))
+        
+        # Detect horizontal and vertical lines
+        horizontal = cv2.erode(self.thresholded_image, horizontal_kernel, iterations=3)
+        vertical = cv2.erode(self.thresholded_image, vertical_kernel, iterations=3)
+        
+        # Combine the lines
+        self.dilated_image = cv2.add(horizontal, vertical)
+        
+        # Dilate to connect components
+        kernel = np.ones((3,3), np.uint8)
+        self.dilated_image = cv2.dilate(self.dilated_image, kernel, iterations=2)
         simple_kernel = np.ones((5,5), np.uint8)
         self.dilated_image = cv2.dilate(self.dilated_image, simple_kernel, iterations=2)
     
@@ -132,11 +147,21 @@ class OcrToTableTool:
                 x1 = min(self.original_image.shape[1], x + w + pad)
                 # Use the processed image with bounding boxes instead of original
                 cropped_image = self.image_with_all_bounding_boxes[y0:y1, x0:x1]
-                image_slice_path = os.path.join(r"C:\Users\Jash\OneDrive\Documents\AnamaloiesAttendanceSystem\ocr_slices\img_", f"img_{image_number}.jpg")
+                image_slice_path = os.path.join(self.ocr_slices_dir, f'img_{image_number}.jpg')
                 cv2.imwrite(image_slice_path, cropped_image)
-                ocr_text = self.get_result_from_tersseract(image_slice_path)
-                cleaned_text = self.clean_ocr_text(ocr_text)
-                cells.append(cleaned_text)
+                
+                # Use VLLM OCR with color detection
+                ocr_text, is_red = self.vllm_ocr.recognize_text(image_slice_path)
+                cleaned_text, attendance_status = self.clean_ocr_text(ocr_text, is_red)
+                
+                # Store both the text and its attendance status
+                cells.append({
+                    'text': cleaned_text,
+                    'status': attendance_status
+                })
+                
+                # Clean up temporary file
+                os.remove(image_slice_path)
                 image_number += 1
             # Expect at least 3 cells for ID, Name, Status
             if len(cells) >= 3:
@@ -153,32 +178,44 @@ class OcrToTableTool:
                 print(f'Attendance: {student.attendance_dates}')
 
     def get_result_from_tersseract(self, image_path):
-        pytesseract_path =  r'C:\Users\Jash\AppData\Local\Programs\Tesseract-OCR' 
-        os.chdir(pytesseract_path)
-        # output = subprocess.getoutput(
-        #     f'"{pytesseract_path}" ' 
-        #     f'"{image_path}" ' 
-        #     '- -l eng --oem 3 --psm 7 --dpi 72 '
-        #     '-c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789().calmg* "')
-
-        output = subprocess.getoutput(f'tesseract {image_path} - -l eng --oem 3 --psm 6 --dpi 72 -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789().calmg PAxX.-* "')
+        """Legacy method kept for compatibility - now uses VLLM OCR"""
+        return self.vllm_ocr.recognize_text(image_path)
         print(output)
         output = output.strip()
 
         os.chdir(r'C:\Users\Jash\OneDrive\Documents\AnamaloiesAttendanceSystem')
         return output
 
-    def clean_ocr_text(self, text: str) -> str:
-        """Clean and validate OCR output, removing gibberish and normalizing valid text.
-        
-        Returns empty string for invalid/gibberish text, normalized text otherwise.
+    def clean_ocr_text(self, text: str, is_red: bool = False) -> str:
         """
-        if text is None:
-            return ""
+        Clean and validate OCR output, removing gibberish and normalizing valid text.
+        Also handles the attendance marking logic based on text color.
+        
+        Returns: A tuple (cleaned_text, attendance_status)
+        where attendance_status is 'Present' or 'Absent' based on the rules:
+        - Any red text (except 'P') -> Absent
+        - Everything else -> Present
+        - Blank -> Absent
+        """
+        if text is None or text.strip() == "":
+            return "", "Absent"
             
-        # remove line breaks and excess whitespace
+        # Remove line breaks and excess whitespace
         cleaned = " ".join(text.split())
-        cleaned = cleaned.strip()
+        cleaned = cleaned.strip().upper()
+        
+        # Apply attendance rules
+        if is_red:
+            if cleaned == "P":
+                return cleaned, "Present"
+            else:
+                return cleaned, "Absent"
+        else:
+            # Non-red text is always present unless blank
+            if cleaned:
+                return cleaned, "Present"
+            else:
+                return cleaned, "Absent"
         
         # Filter out gibberish/invalid text
         if len(cleaned) < 2:  # Too short
@@ -263,21 +300,23 @@ class OcrToTableTool:
             x1 = min(self.original_image.shape[1], x + w + pad)
             # Use the processed image with bounding boxes instead of original
             cropped = self.image_with_all_bounding_boxes[y0:y1, x0:x1]
-            image_path = os.path.join(r"C:\Users\Jash\OneDrive\Documents\AnamaloiesAttendanceSystem\ocr_slices\img_", f"img_{len(headers)}.jpg")
+            image_path = os.path.join(self.ocr_slices_dir, f"header_{len(headers)}.jpg")
             cv2.imwrite(image_path, cropped)
-            text = self.get_result_from_tersseract(image_path)
-            headers.append(text.strip())
+            text, _ = self.vllm_ocr.recognize_text(image_path)
+            if os.path.exists(image_path):
+                os.remove(image_path)
+            headers.append(text.strip() if text else "")
         return headers
 
     def _process_student_row(self, cells, date_indices):
-        """Convert a list of OCR extracted texts into a StudentRecord based on expected columns.
+        """Convert a list of OCR extracted cells into a StudentRecord.
+        Each cell is a dict with 'text' and 'status' keys.
         Expected:
             cells[0] -> Student ID
             cells[1] -> Student Name
-            cells[2] -> Status (P, AB, A)
-            cells[3:] -> Attendance marks corresponding to header dates
+            cells[2:] -> Attendance marks with their status
         """
-        if len(cells) < 3:
+        if len(cells) < 2:
             return None
         student = StudentRecord(
             student_id=cells[0],

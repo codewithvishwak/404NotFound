@@ -1,43 +1,40 @@
 import streamlit as st
 import pandas as pd
 import os
-import re # Import regex for advanced text parsing
+import re
 from pdf2image import convert_from_bytes
 from PIL import Image
 import io
-# import pytesseract # Uncomment if you implement real OCR
+from config import *
+from fast_ocr import FastAttendanceOCR
 
-# --- Configuration ---
-IMAGES_DIR = "Images"
-OUTPUT_DIR = "Output_Reports"
-POPPLER_PATH =  r"C:\Users\Jash\AppData\Local\Programs\poppler-25.07.0\Library\bin" # Set to r"C:\path\to\poppler-xx\bin" if on Windows and Poppler is not in PATH
-
-# Create necessary directories
-os.makedirs(IMAGES_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Initialize OCR
+ocr_tool = FastAttendanceOCR()
 
 # --- Symbol Mapping and Cleaning Function ---
 
-def clean_attendance_marks(mark):
+def clean_attendance_marks(mark, is_red=False):
     """
     Cleans and maps the OCR output based on specific rules:
-    P, Tick, Dot -> Present (1)
-    A, AB, Cross -> Absent (0)
-    Blank/Other -> Unclear (0, but we track it)
+    - Any red text (except 'P') -> Absent
+    - Everything else -> Present
+    - Blank -> Absent
     """
     if pd.isna(mark) or str(mark).strip() == '':
-        return 'Unclear'
+        return 'Absent'  # Changed from 'Unclear' to 'Absent'
 
     mark_str = str(mark).strip().upper()
 
-    # Define patterns for Present marks (P, Tick, Dot)
-    # The 'Tick' symbol might be OCR'd as different characters, 
-    # so we use common handwritten/OCR representations like P, dot, checkmark symbols
-    present_patterns = r'^(P|TICK|DOT|\.|✓|√|1)$' 
+    # If text is red
+    if is_red:
+        # Check if it's a 'P' in red
+        if mark_str == 'P':
+            return 'Present'
+        else:
+            return 'Absent'
     
-    # Define patterns for Absent marks (A, AB, Cross)
-    # The 'Cross' symbol might be OCR'd as X, A, AB, etc.
-    absent_patterns = r'^(A|AB|X|CROSS|0)$'
+    # For non-red text, everything is considered present except blanks
+    return 'Present'
 
     if re.match(present_patterns, mark_str):
         return 'Present'
@@ -53,12 +50,66 @@ def convert_pdf_to_images(uploaded_file):
     """Converts an uploaded PDF (in bytes) to images and saves them."""
     st.info(f"Converting PDF: {uploaded_file.name} to images...")
     
-    # 1. Convert PDF bytes to a list of PIL Images
+    # 1. Set up Poppler path and environment
+    poppler_path = r"C:\poppler\Release-23.11.0-0\Library\bin"
+    if not os.path.exists(poppler_path):
+        st.error(f"Poppler not found at {poppler_path}")
+        st.info("Downloading and installing Poppler...")
+        try:
+            # Create directory
+            os.makedirs(r"C:\poppler", exist_ok=True)
+            
+            # Download Poppler
+            import urllib.request
+            url = "https://github.com/oschwartz10612/poppler-windows/releases/download/v23.11.0-0/Release-23.11.0-0.zip"
+            zip_path = r"C:\poppler\poppler.zip"
+            urllib.request.urlretrieve(url, zip_path)
+            
+            # Extract
+            import zipfile
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(r"C:\poppler")
+                
+            # Add to system PATH
+            import sys
+            os.environ["PATH"] += os.pathsep + poppler_path
+            st.success("Poppler installed and added to PATH successfully!")
+            
+        except Exception as e:
+            st.error(f"Failed to install Poppler: {e}")
+            return []
+
+    # 2. Convert PDF to images
     try:
-        images = convert_from_bytes(uploaded_file.read(), poppler_path=POPPLER_PATH, dpi=200)
+        # Verify poppler installation
+        if not os.path.exists(os.path.join(poppler_path, "pdfinfo.exe")):
+            st.error("Poppler binaries not found. Attempting to fix...")
+            # Force re-download
+            import urllib.request
+            url = "https://github.com/oschwartz10612/poppler-windows/releases/download/v23.11.0-0/Release-23.11.0-0.zip"
+            zip_path = r"C:\poppler\poppler.zip"
+            urllib.request.urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(r"C:\poppler")
+                
+        # Update PATH again
+        if poppler_path not in os.environ["PATH"]:
+            os.environ["PATH"] += os.pathsep + poppler_path
+            
+        # Convert PDF
+        pdf_bytes = uploaded_file.read()
+        images = convert_from_bytes(pdf_bytes, poppler_path=poppler_path, dpi=200)
+        
+        if not images:
+            st.error("No images extracted from PDF")
+            return []
+            
+        st.success(f"PDF converted successfully! Extracted {len(images)} pages.")
+        
     except Exception as e:
-        st.error(f"PDF Conversion Failed. Is Poppler installed correctly? Error: {e}")
-        st.caption("On Windows, you may need to set the POPPLER_PATH variable in the script.")
+        st.error(f"PDF Conversion Failed: {str(e)}")
+        st.info(f"Current Poppler path: {poppler_path}")
+        st.info(f"Files in Poppler bin: {os.listdir(poppler_path) if os.path.exists(poppler_path) else 'Directory not found'}")
         return []
 
     # 2. Save Images to the Images folder
@@ -76,13 +127,35 @@ def convert_pdf_to_images(uploaded_file):
 
 def extract_attendance_data_from_image(image_path):
     """
-    *** Placeholder for Complex OCR and Data Extraction Logic ***
-    
-    This function now uses the cleaner function after simulating OCR extraction.
-    In a real app, you would OCR the attendance grid, get raw marks, and then clean them.
+    Extract attendance data from image using VLLM OCR
     """
+    st.info(f"Processing attendance data from {os.path.basename(image_path)}...")
     
-    st.warning(f"Simulating OCR and data extraction from {os.path.basename(image_path)}...")
+    try:
+        # Process image using FastAttendanceOCR
+        results = ocr_tool.process_image(image_path)
+        
+        # Convert results to DataFrame
+        data = {
+            'Roll No': [],
+            'Student Name': [],
+            'Status': [],
+        }
+        
+        # Group results by pairs (assuming every two cells form a student record)
+        for i in range(0, len(results), 2):
+            if i + 1 < len(results):
+                data['Roll No'].append(results[i]['text'])
+                data['Student Name'].append(results[i + 1]['text'])
+                data['Status'].append(results[i + 1]['status'])
+        
+        df = pd.DataFrame(data)
+        st.success(f"Successfully processed {len(df)} student records")
+        return df
+        
+    except Exception as e:
+        st.error(f"Error processing image: {str(e)}")
+        return pd.DataFrame()
     
     # --- SIMULATED RAW OCR DATA (Imagine this is what Tesseract returned) ---
     data = {
