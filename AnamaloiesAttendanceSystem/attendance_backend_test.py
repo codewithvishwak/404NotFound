@@ -8,41 +8,42 @@ import io
 from config import *
 from fast_ocr import FastAttendanceOCR
 
+# Import openpyxl for Excel file handling
+import openpyxl
+
 # Initialize OCR
 ocr_tool = FastAttendanceOCR()
 
 # --- Symbol Mapping and Cleaning Function ---
+# Define patterns for attendance marks
+present_patterns = r'^[P\.✓]$'
+absent_patterns = r'^[AX×]$|^AB$'
 
 def clean_attendance_marks(mark, is_red=False):
     """
     Cleans and maps the OCR output based on specific rules:
     - Any red text (except 'P') -> Absent
-    - Everything else -> Present
+    - P, dot(.), or tick(✓) -> Present
+    - A, X, AB -> Absent
     - Blank -> Absent
+    - Other non-red text -> Present
     """
     if pd.isna(mark) or str(mark).strip() == '':
-        return 'Absent'  # Changed from 'Unclear' to 'Absent'
+        return 'Absent'
 
     mark_str = str(mark).strip().upper()
 
     # If text is red
     if is_red:
-        # Check if it's a 'P' in red
-        if mark_str == 'P':
-            return 'Present'
-        else:
-            return 'Absent'
+        return 'Present' if mark_str == 'P' else 'Absent'
     
-    # For non-red text, everything is considered present except blanks
-    return 'Present'
-
+    # For non-red text
     if re.match(present_patterns, mark_str):
         return 'Present'
     elif re.match(absent_patterns, mark_str):
         return 'Absent'
     else:
-        # Catch any other single characters or bad OCR that are not explicitly P/A
-        return 'Unclear'
+        return 'Present'  # Default to Present for non-red text
 
 # --- Core Logic Functions (Modified) ---
 
@@ -297,11 +298,7 @@ if uploaded_file is not None:
         image_paths = convert_pdf_to_images(uploaded_file)
         
         if image_paths:
-            st.subheader("Data Extraction (Simulated OCR)")
-            data_df = extract_attendance_data_from_image(image_paths[0])
-            st.dataframe(data_df)
-
-    elif file_type in ['csv', 'vnd.ms-excel']:
+        data_df = extract_attendance_data_from_image(image_paths[0])    elif file_type in ['csv', 'vnd.ms-excel']:
         st.info("CSV file detected. Bypassing image conversion/OCR...")
         # Placeholder logic: Assumes CSV columns are already clean
         data_df = pd.read_csv(uploaded_file)
@@ -321,7 +318,32 @@ if uploaded_file is not None:
         st.dataframe(data_df)
     
     # --- Step 3: Generate Reports ---
-    if not data_df.empty and st.button("Generate Final Reports"):
-        generate_reports(data_df, subject_name)
-        st.balloons()
-        st.success("All reports generated successfully in the 'Output_Reports' folder!")
+    if not data_df.empty:
+        # Show the extracted data
+        st.subheader("Extracted Attendance Data")
+        st.dataframe(data_df)
+        
+        # Generate reports automatically
+        with st.spinner("Generating attendance reports..."):
+            generate_reports(data_df, subject_name)
+            st.balloons()
+            st.success("All reports generated successfully in the 'Output_Reports' folder!")
+            
+            # Display download buttons for each report
+            st.subheader("Download Reports")
+            report_files = {
+                "Subject Report": f"{subject_name}_Attendance_Report.xlsx",
+                "Department Summary": "Department_Attendance_Summary.xlsx",
+                "Administrative Reports": "Administrative_Action_Reports.xlsx"
+            }
+            
+            for report_name, filename in report_files.items():
+                file_path = os.path.join(OUTPUT_DIR, filename)
+                if os.path.exists(file_path):
+                    with open(file_path, "rb") as f:
+                        st.download_button(
+                            label=f"Download {report_name}",
+                            data=f.read(),
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
